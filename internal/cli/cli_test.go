@@ -138,3 +138,14 @@ func TestUntrustedCertificate(t *testing.T) {
 	require.Equal(t, cli.ExitError, code)
 	require.Contains(t, out, "certificate")
 }
+
+func TestJSONReportsInvalidDeclaration(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "bad.yaml")
+	require.NoError(t, os.WriteFile(f, []byte("networks:\n  - { name: a, subnet: 192.0.2.0/24 }\n"), 0o600))
+	code, out, _ := run(t, "plan", "-o", "json", "-f", f, "-provider", "unifi")
+	require.Equal(t, cli.ExitError, code)
+	var line map[string]any
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(out)), &line))
+	require.Equal(t, "failed", line["status"])
+	require.Contains(t, line["error"], "match is required")
+}

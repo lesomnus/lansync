@@ -123,12 +123,18 @@ func runSync(ctx context.Context, apply bool, args []string, stdout, stderr io.W
 	c, err := spec.LoadFile(f.file)
 	if err != nil {
 		printLoadError(stderr, f.file, err)
+		if f.output == "json" {
+			writeFailure(stdout, f.providerName, fmt.Sprintf("%s is not valid: %v", f.file, err))
+		}
 		return ExitError
 	}
 
 	p, err := newProvider(f)
 	if err != nil {
 		fmt.Fprintf(stderr, "lansync: %v\n", err)
+		if f.output == "json" {
+			writeFailure(stdout, f.providerName, err.Error())
+		}
 		return ExitError
 	}
 
@@ -213,11 +219,17 @@ type jsonLine struct {
 	plan.NetworkResult
 }
 
+// writeFailure reports, in the JSON output, a failure that happened before
+// any network was looked at, so that log-based monitoring sees it as one.
+func writeFailure(w io.Writer, providerName, msg string) {
+	_ = json.NewEncoder(w).Encode(map[string]string{"provider": providerName, "status": string(plan.Failed), "error": msg})
+}
+
 func writeJSON(w io.Writer, pl *plan.Plan) {
-	enc := json.NewEncoder(w)
 	for _, e := range pl.Errors {
-		_ = enc.Encode(map[string]string{"provider": pl.Provider, "status": string(plan.Failed), "error": e})
+		writeFailure(w, pl.Provider, e)
 	}
+	enc := json.NewEncoder(w)
 	for _, n := range pl.Networks {
 		_ = enc.Encode(jsonLine{Provider: pl.Provider, NetworkResult: n})
 	}
