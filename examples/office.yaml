@@ -1,0 +1,39 @@
+# An office with two wired floors and one Wi-Fi network.
+# Addresses are documentation ranges (RFC 5737); replace them with yours.
+
+layouts:
+  # One address plan for every wired floor. ".N" is the N-th address of the
+  # network's subnet, so the same layout fits each floor.
+  office:
+    blocks:
+      - { name: gateway, ranges: [.1] }
+      - { name: core,    ranges: [.2-.9] }      # switches
+      - { name: infra,   ranges: [.10-.49] }    # access points
+      - { name: devices, ranges: [.50-.79] }    # printers, meeting rooms
+      - { name: staff,   ranges: [.80-.99] }    # reserved by hand, not by lansync
+      - { name: dhcp,    ranges: [.100-.199] }
+      - { name: static,  ranges: [.200-.254] }  # devices with a fixed address set on the device
+
+networks:
+  - name: floor-2
+    match: { vlan: 2 }
+    subnet: 192.0.2.0/24
+    layout: office
+    dhcp: { block: dhcp, leaseTime: 24h }
+    mode: apply
+
+  - name: floor-4
+    match: { vlan: 4 }
+    subnet: 198.51.100.0/24
+    layout: office
+    dhcp: { block: dhcp, leaseTime: 8h }
+    # dry-run: report the difference, change nothing (the default).
+
+  # Clients only, so almost all of it is the pool.
+  - name: wifi
+    match: { vlan: 12 }
+    subnet: 203.0.113.0/24
+    blocks:
+      - { name: gateway, ranges: [.1] }
+      - { name: dhcp,    ranges: [.10-.199] }
+    dhcp: { block: dhcp, leaseTime: 4h }
