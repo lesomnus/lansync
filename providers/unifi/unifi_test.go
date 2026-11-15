@@ -3,6 +3,7 @@ package unifi_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -31,6 +32,11 @@ type controller struct {
 	// mutate, when set, changes the stored network after a PUT, to play a
 	// controller that does more than it was asked.
 	mutate func(map[string]any)
+	// mutateConf does the same to the full record, for settings the
+	// Integration API does not show.
+	mutateConf func(map[string]any)
+	// conf is the full record (rest/networkconf) per Integration id.
+	conf map[string]map[string]any
 }
 
 func network(id, name string, vlan int, host string, prefix int, dhcp map[string]any) map[string]any {
@@ -71,12 +77,21 @@ func server() map[string]any {
 }
 
 func newController(t *testing.T) *controller {
-	return &controller{t: t, networks: []map[string]any{
+	c := &controller{t: t, conf: map[string]map[string]any{}, networks: []map[string]any{
 		network("11111111-0000-0000-0000-000000000002", "F2", 2, "192.0.2.1", 24, server()),
 		network("11111111-0000-0000-0000-000000000003", "Relay", 3, "198.51.100.1", 24,
 			map[string]any{"mode": "RELAY", "dhcpServerIpAddresses": []any{"198.51.100.250"}}),
 		network("11111111-0000-0000-0000-000000000004", "NoDHCP", 4, "203.0.113.1", 24, nil),
 	}}
+	for i, n := range c.networks {
+		id := n["id"].(string)
+		c.conf[id] = map[string]any{
+			"_id": fmt.Sprintf("%024d", i), "external_id": id, "name": n["name"], "vlan": n["vlanId"],
+			"mdns_enabled": true, "igmp_snooping": false, "dhcpd_dns_enabled": false,
+			"dhcpd_start": "192.0.2.6", "dhcpd_stop": "192.0.2.254", "dhcpd_leasetime": 86400,
+		}
+	}
+	return c
 }
 
 func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +117,12 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/proxy/network/api/s/default/rest/networkconf":
+		var data []any
+		for _, n := range c.networks {
+			data = append(data, c.conf[n["id"].(string)])
+		}
+		write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": data})
 	case r.Method == http.MethodGet && path == "/v1/sites":
 		paged([]any{
 			map[string]any{"id": "99999999-0000-0000-0000-000000000000", "internalReference": "other", "name": "Other"},
@@ -141,6 +162,18 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				c.mutate(stored)
 			}
 			c.networks[i] = stored
+			// The controller keeps one record; the Integration view and
+			// the full record are two views of it.
+			conf := c.conf[id]
+			if dc, ok := stored["ipv4Configuration"].(map[string]any)["dhcpConfiguration"].(map[string]any); ok {
+				if r, ok := dc["ipAddressRange"].(map[string]any); ok {
+					conf["dhcpd_start"], conf["dhcpd_stop"] = r["start"], r["stop"]
+				}
+				conf["dhcpd_leasetime"] = dc["leaseTimeSeconds"]
+			}
+			if c.mutateConf != nil {
+				c.mutateConf(conf)
+			}
 			write(stored)
 		default:
 			http.Error(w, "", http.StatusMethodNotAllowed)
@@ -262,6 +295,42 @@ func TestUpdateNetworkDetectsSideEffects(t *testing.T) {
 		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
 	})
 	require.ErrorContains(t, err, "internetAccessEnabled")
+}
+
+func TestUpdateNetworkDetectsHiddenSideEffects(t *testing.T) {
+	ctx := context.Background()
+	c, p := setup(t)
+	c.mutateConf = func(n map[string]any) { n["mdns_enabled"] = false }
+
+	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{
+		ID:         "11111111-0000-0000-0000-000000000002",
+		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
+	})
+	require.ErrorContains(t, err, "mdns_enabled: true -> false")
+}
+
+func TestUpdateNetworkChecksTheFullRecord(t *testing.T) {
+	ctx := context.Background()
+	c, p := setup(t)
+	// The Integration view says the pool changed, the record does not.
+	c.mutateConf = func(n map[string]any) { n["dhcpd_stop"] = "192.0.2.254" }
+
+	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{
+		ID:         "11111111-0000-0000-0000-000000000002",
+		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
+	})
+	require.ErrorContains(t, err, `dhcpd_stop is "192.0.2.254", want 192.0.2.199`)
+}
+
+func TestUpdateNetworkNeedsLegacyRoot(t *testing.T) {
+	c := newController(t)
+	srv := httptest.NewTLSServer(c)
+	defer srv.Close()
+	p, err := unifi.New(unifi.Config{BaseURL: srv.URL + "/somewhere", APIKey: "secret", Client: srv.Client()})
+	require.NoError(t, err)
+	err = p.UpdateNetwork(context.Background(), provider.NetworkUpdate{ID: "x", LeaseTime: time.Hour})
+	require.ErrorContains(t, err, "legacy base URL")
+	require.Empty(t, c.puts)
 }
 
 func TestUpdateNetworkRefusesWithoutServer(t *testing.T) {

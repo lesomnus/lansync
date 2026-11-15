@@ -76,16 +76,6 @@ type Block struct {
 	Ranges Ranges
 }
 
-// Mode says what lansync may do to a network.
-type Mode string
-
-const (
-	// DryRun reports differences and never changes the network.
-	DryRun Mode = "dry-run"
-	// Apply makes the network match the declaration.
-	Apply Mode = "apply"
-)
-
 // DHCP is the declared DHCP server of a network.
 type DHCP struct {
 	// Block is the name of the block that is the address pool.
@@ -107,7 +97,6 @@ type Network struct {
 	Blocks []Block
 	// DHCP is nil when DHCP is not managed.
 	DHCP *DHCP
-	Mode Mode
 }
 
 func (n *Network) Block(name string) (Block, bool) {

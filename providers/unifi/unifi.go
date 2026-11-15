@@ -14,6 +14,13 @@
 // API documents that a missing dhcpConfiguration means "no DHCP"). So an update
 // reads the network, changes only the DHCP fields, writes it back, reads it
 // again and fails if anything other than those fields changed.
+//
+// The Integration API does not show every setting of a network (mDNS, IGMP
+// snooping, DHCP DNS options, …). To see whether a PUT reset one of those, an
+// update also reads the network's full record from the controller's own API
+// (GET /api/s/{site}/rest/networkconf, matched by external_id) before and
+// after, and fails if anything but the DHCP pool and lease time changed. That
+// API is undocumented; it is only read.
 package unifi
 
 import (
@@ -45,17 +52,23 @@ type Config struct {
 	Site string
 	// APIKey is sent as X-API-KEY.
 	APIKey string
+	// LegacyBaseURL is the root of the controller's own API, the part
+	// before /api/s/{site}. Empty means BaseURL without its trailing
+	// /integration, e.g. https://192.0.2.1/proxy/network.
+	LegacyBaseURL string
 	// Client is the HTTP client. It decides TLS trust; nil uses
 	// http.DefaultClient.
 	Client *http.Client
 }
 
 type Provider struct {
-	cfg  Config
-	base *url.URL
+	cfg    Config
+	base   *url.URL
+	legacy *url.URL // nil when it cannot be derived; updates then refuse
 
-	mu     sync.Mutex
-	siteID string
+	mu      sync.Mutex
+	siteID  string
+	siteRef string
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -80,7 +93,20 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.Client == nil {
 		cfg.Client = http.DefaultClient
 	}
-	return &Provider{cfg: cfg, base: u}, nil
+	p := &Provider{cfg: cfg, base: u}
+	switch {
+	case cfg.LegacyBaseURL != "":
+		l, err := url.Parse(strings.TrimSuffix(cfg.LegacyBaseURL, "/"))
+		if err != nil {
+			return nil, fmt.Errorf("unifi: legacy base URL: %w", err)
+		}
+		p.legacy = l
+	case strings.HasSuffix(u.Path, "/integration"):
+		l := *u
+		l.Path = strings.TrimSuffix(u.Path, "/integration")
+		p.legacy = &l
+	}
+	return p, nil
 }
 
 func (p *Provider) Name() string { return "unifi" }
@@ -232,6 +258,10 @@ func (p *Provider) UpdateNetwork(ctx context.Context, u provider.NetworkUpdate) 
 		return errors.New("unifi: an empty DHCP pool is not supported")
 	}
 
+	if p.legacy == nil {
+		return errors.New("unifi: cannot tell the controller's own API root from the base URL; set the legacy base URL so updates can be verified")
+	}
+
 	siteID, err := p.site(ctx)
 	if err != nil {
 		return err
@@ -241,6 +271,10 @@ func (p *Provider) UpdateNetwork(ctx context.Context, u provider.NetworkUpdate) 
 	before, err := p.getRaw(ctx, path)
 	if err != nil {
 		return fmt.Errorf("unifi: read before update: %w", err)
+	}
+	confBefore, err := p.networkConf(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("unifi: read full record before update (nothing was changed): %w", err)
 	}
 
 	want, err := deepCopy(before)
@@ -263,7 +297,89 @@ func (p *Provider) UpdateNetwork(ctx context.Context, u provider.NetworkUpdate) 
 	if diff := diffPaths(shallowWithout(want, readOnly), shallowWithout(after, readOnly), ""); len(diff) > 0 {
 		return fmt.Errorf("unifi: after the update the network differs from what was sent at %s; check it on the controller", strings.Join(diff, ", "))
 	}
+
+	confAfter, err := p.networkConf(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("unifi: read full record after update (the update was sent): %w", err)
+	}
+	if err := checkConf(confBefore, confAfter, u); err != nil {
+		return fmt.Errorf("unifi: the update changed more than the DHCP pool and lease time; restore these on the controller: %w", err)
+	}
 	return nil
+}
+
+// managedConf are the fields of a networkconf record that an update may change.
+var managedConf = []string{"dhcpd_start", "dhcpd_stop", "dhcpd_leasetime"}
+
+func checkConf(before, after map[string]any, u provider.NetworkUpdate) error {
+	var problems []string
+	for _, k := range diffPaths(shallowWithout(before, managedConf), shallowWithout(after, managedConf), "") {
+		problems = append(problems, fmt.Sprintf("%s: %s -> %s", k, show(lookup(before, k)), show(lookup(after, k))))
+	}
+	expect := func(k, want string) {
+		if got := fmt.Sprint(after[k]); got != want {
+			problems = append(problems, fmt.Sprintf("%s is %s, want %s", k, show(after[k]), want))
+		}
+	}
+	if len(u.DHCPRanges) == 1 {
+		expect("dhcpd_start", u.DHCPRanges[0].First.String())
+		expect("dhcpd_stop", u.DHCPRanges[0].Last.String())
+	}
+	if u.LeaseTime != 0 {
+		expect("dhcpd_leasetime", strconv.FormatInt(int64(u.LeaseTime/time.Second), 10))
+	}
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func lookup(m map[string]any, path string) any {
+	var cur any = m
+	for _, k := range strings.Split(path, ".") {
+		mm, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = mm[k]
+	}
+	return cur
+}
+
+func show(v any) string {
+	if v == nil {
+		return "(none)"
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return string(b)
+}
+
+// networkConf reads the controller's full record of the network whose
+// Integration API id is id.
+func (p *Provider) networkConf(ctx context.Context, id string) (map[string]any, error) {
+	ref, err := p.siteReference(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := p.doURL(ctx, http.MethodGet, p.legacy, "/api/s/"+url.PathEscape(ref)+"/rest/networkconf", nil, &res); err != nil {
+		return nil, err
+	}
+	var match []map[string]any
+	for _, n := range res.Data {
+		if n["external_id"] == id {
+			match = append(match, n)
+		}
+	}
+	if len(match) != 1 {
+		return nil, fmt.Errorf("%d networkconf records have external_id %s", len(match), id)
+	}
+	return match[0], nil
 }
 
 func setDHCP(m map[string]any, u provider.NetworkUpdate) error {
@@ -310,7 +426,20 @@ func (p *Provider) site(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("unifi: site %q matches %d sites", p.cfg.Site, len(match))
 	}
 	p.siteID = match[0].ID
+	p.siteRef = match[0].InternalReference
 	return p.siteID, nil
+}
+
+func (p *Provider) siteReference(ctx context.Context) (string, error) {
+	if _, err := p.site(ctx); err != nil {
+		return "", err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.siteRef == "" {
+		return "", errors.New("unifi: the site has no internal reference")
+	}
+	return p.siteRef, nil
 }
 
 func (p *Provider) networkPath(siteID, id string) string {
@@ -351,12 +480,16 @@ func (p *Provider) getRaw(ctx context.Context, path string) (map[string]any, err
 }
 
 func (p *Provider) do(ctx context.Context, method, path string, body any, out any) error {
+	return p.doURL(ctx, method, p.base, path, body, out)
+}
+
+func (p *Provider) doURL(ctx context.Context, method string, base *url.URL, path string, body any, out any) error {
 	ref, err := url.Parse(path)
 	if err != nil {
 		return err
 	}
-	u := *p.base
-	u.Path = p.base.Path + ref.Path
+	u := *base
+	u.Path = base.Path + ref.Path
 	u.RawQuery = ref.RawQuery
 
 	var rd io.Reader

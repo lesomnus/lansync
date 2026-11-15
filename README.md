@@ -44,7 +44,6 @@ networks:
     subnet: 192.0.2.0/24
     layout: office
     dhcp: { block: dhcp, leaseTime: 8h }
-    mode: apply
 
 reservations:
   - { name: ap-01, mac: "00:00:5e:00:53:01", network: floor-2, block: infra, ip: .11 }
@@ -77,7 +76,13 @@ one or more `ranges`. Ranges of a block need not be contiguous.
 | `blocks` | Optional. More blocks, added to the layout's. |
 | `dhcp.block` | The block that is the DHCP pool. |
 | `dhcp.leaseTime` | Optional, e.g. `8h`. Left alone when omitted. |
-| `mode` | `dry-run` (default) reports differences; `apply` lets `lansync apply` change the network. |
+
+The declaration says what a network should be, never whether to change it now.
+That is decided when lansync is run (`apply -network`, below).
+
+Common values can be shared with YAML anchors, e.g.
+`dhcp: &wired { block: dhcp, leaseTime: 8h }` on one network and `dhcp: *wired` on
+the next. Merge keys (`<<:`) that override fields are not supported.
 
 Rules checked before anything is read from the controller:
 
@@ -104,14 +109,15 @@ because it names it. Use YAML comments for notes.
 ```sh
 lansync check -f lansync.yaml
 lansync plan  -f lansync.yaml -provider unifi -unifi-url https://192.0.2.1/proxy/network/integration
-lansync apply -f lansync.yaml -provider unifi -unifi-url https://192.0.2.1/proxy/network/integration
+lansync apply -f lansync.yaml -network floor-2 -provider unifi -unifi-url https://192.0.2.1/proxy/network/integration
 ```
 
 - `check` validates the file and does not contact anything.
-- `plan` shows what differs and changes nothing, whatever the networks' `mode`.
-- `apply` changes the networks whose `mode` is `apply`; the others are reported
-  as they are in `plan`. If the declaration needs something the provider cannot
-  do (e.g. two ranges in one UniFi pool), nothing is applied at all.
+- `plan` shows what differs and changes nothing.
+- `apply -network NAMES` changes the named networks (comma-separated, or `all`)
+  and reports the others as `plan` does. A name that is not declared, or a
+  declaration that needs something the provider cannot do (e.g. two ranges in
+  one UniFi pool), applies nothing at all.
 
 Output is a table, or with `-o json` one JSON object per network:
 
@@ -119,7 +125,10 @@ Output is a table, or with `-o json` one JSON object per network:
 {"provider":"unifi","network":"floor-2","selector":"vlan=2","mode":"apply","id":"…","status":"applied","changes":[{"field":"dhcp.ranges","from":"192.0.2.6-192.0.2.254","to":"192.0.2.100-192.0.2.199"}]}
 ```
 
-`status` is `in-sync`, `drift` (differs, left as is), `applied` or `failed`.
+`mode` is `apply` for the networks named in `-network`, otherwise `dry-run`.
+`status` is `in-sync`, `drift` (differs, left as is), `applied` or `failed`. A
+failure before any network is looked at (invalid declaration, bad flags) is one
+line with `status: failed` and no `network`.
 
 Exit code: `1` if anything failed, otherwise `0`. With `-detailed-exitcode`, `2`
 when a network differs and was left as is.
@@ -131,6 +140,7 @@ Uses the official **Integration API** of UniFi Network 10.x.
 | Flag | |
 |---|---|
 | `-unifi-url` | API root without `/v1`. UniFi OS consoles: `https://<console>/proxy/network/integration`. |
+| `-unifi-legacy-url` | Root of the controller's own API, read to verify updates. Default: `-unifi-url` without `/integration`. |
 | `-unifi-site` | Site internal reference (default `default`), name or ID. |
 | `-unifi-api-key-file` | File with the API key. Otherwise `$LANSYNC_UNIFI_API_KEY`. |
 | `-unifi-ca` | PEM of the certificate to trust. A console's self-signed certificate can be given directly. |
@@ -142,8 +152,16 @@ settings; create a dedicated admin for it.
 **How an update is made safe.** The API replaces the whole network on update —
 a field left out is reset (a missing DHCP configuration means "no DHCP"). So
 lansync reads the network, changes only the DHCP pool and lease time, writes it
-back, reads it again, and fails loudly if anything else differs. It never turns
-a DHCP server on or off, and refuses networks that relay DHCP.
+back, reads it again, and fails loudly if anything else differs.
+
+The Integration API does not show every setting of a network (mDNS, IGMP
+snooping, DHCP DNS options, …). So lansync also reads the network's full record
+from the controller's own API (`/api/s/{site}/rest/networkconf`, matched by
+`external_id`) before and after the update, and fails — naming each setting with
+its old and new value — if anything but the pool and lease time changed. That
+API is undocumented and only read.
+
+It never turns a DHCP server on or off, and refuses networks that relay DHCP.
 
 UniFi has one range per DHCP pool, so a `dhcp.block` with several ranges is
 refused for UniFi.

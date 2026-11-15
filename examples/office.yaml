@@ -15,19 +15,18 @@ layouts:
       - { name: static,  ranges: [.200-.254] }  # devices with a fixed address set on the device
 
 networks:
+  # A YAML anchor shares a value between networks.
   - name: floor-2
     match: { vlan: 2 }
     subnet: 192.0.2.0/24
     layout: office
-    dhcp: { block: dhcp, leaseTime: 24h }
-    mode: apply
+    dhcp: &wired-dhcp { block: dhcp, leaseTime: 8h }
 
   - name: floor-4
     match: { vlan: 4 }
     subnet: 198.51.100.0/24
     layout: office
-    dhcp: { block: dhcp, leaseTime: 8h }
-    # dry-run: report the difference, change nothing (the default).
+    dhcp: *wired-dhcp
 
   # Clients only, so almost all of it is the pool.
   - name: wifi

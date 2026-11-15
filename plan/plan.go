@@ -13,6 +13,28 @@ import (
 	"github.com/lesomnus/lansync/provider"
 )
 
+// Mode says what lansync may do to a network in this run.
+type Mode string
+
+const (
+	// DryRun reports differences and never changes the network.
+	DryRun Mode = "dry-run"
+	// Apply makes the network match the declaration.
+	Apply Mode = "apply"
+)
+
+// Targets selects the networks that Apply may change. Whether to change a
+// network is decided by whoever runs lansync, not by the declaration: the
+// declaration says what the network should be.
+type Targets struct {
+	All   bool
+	Names []string
+}
+
+func (t Targets) has(name string) bool {
+	return t.All || slices.Contains(t.Names, name)
+}
+
 // Status is the outcome for one network.
 type Status string
 
@@ -39,7 +61,7 @@ type Change struct {
 type NetworkResult struct {
 	Network  string   `json:"network"`
 	Selector string   `json:"selector"`
-	Mode     lan.Mode `json:"mode"`
+	Mode     Mode     `json:"mode"`
 	ID       string   `json:"id,omitempty"`
 	Status   Status   `json:"status"`
 	Changes  []Change `json:"changes,omitempty"`
@@ -81,12 +103,18 @@ func (p *Plan) HasDrift() bool {
 }
 
 // Make reads the provider and decides the changes. It changes nothing.
-func Make(ctx context.Context, c *lan.Config, p provider.Provider) *Plan {
+// Networks in targets are marked to be changed by Apply.
+func Make(ctx context.Context, c *lan.Config, p provider.Provider, targets Targets) *Plan {
 	caps := p.Capabilities()
 	pl := &Plan{Provider: p.Name()}
 
 	for _, e := range checkCapabilities(c, caps, p.Name()) {
 		pl.Errors = append(pl.Errors, e.Error())
+	}
+	for _, name := range targets.Names {
+		if !slices.ContainsFunc(c.Networks, func(n lan.Network) bool { return n.Name == name }) {
+			pl.Errors = append(pl.Errors, fmt.Sprintf("network %q is not declared", name))
+		}
 	}
 
 	for i := range c.Networks {
@@ -94,7 +122,10 @@ func Make(ctx context.Context, c *lan.Config, p provider.Provider) *Plan {
 		r := NetworkResult{
 			Network:  n.Name,
 			Selector: n.SelectorString(),
-			Mode:     n.Mode,
+			Mode:     DryRun,
+		}
+		if targets.has(n.Name) {
+			r.Mode = Apply
 		}
 		if err := planNetwork(ctx, n, p, &r); err != nil {
 			r.Status = Failed
@@ -186,15 +217,15 @@ func planNetwork(ctx context.Context, n *lan.Network, p provider.Provider, r *Ne
 	return nil
 }
 
-// Apply changes the networks whose mode is apply and that drifted. It does
-// nothing when the plan has declaration-level errors.
+// Apply changes the targeted networks that drifted. It does nothing when the
+// plan has declaration-level errors.
 func (pl *Plan) Apply(ctx context.Context, p provider.Provider) {
 	if len(pl.Errors) > 0 {
 		return
 	}
 	for i := range pl.Networks {
 		r := &pl.Networks[i]
-		if r.Status != Drift || r.Mode != lan.Apply || r.update == nil {
+		if r.Status != Drift || r.Mode != Apply || r.update == nil {
 			continue
 		}
 		if err := p.UpdateNetwork(ctx, *r.update); err != nil {

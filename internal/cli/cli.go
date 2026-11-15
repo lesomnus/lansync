@@ -16,7 +16,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/lesomnus/lansync/lan"
 	"github.com/lesomnus/lansync/plan"
 	"github.com/lesomnus/lansync/provider"
 	"github.com/lesomnus/lansync/providers/unifi"
@@ -28,7 +27,9 @@ const usage = `lansync keeps network controllers in line with a declared LAN add
 Usage:
   lansync check  [-f FILE]                 validate the declaration only
   lansync plan   [-f FILE] PROVIDER-FLAGS  show what differs; change nothing
-  lansync apply  [-f FILE] PROVIDER-FLAGS  change networks whose mode is apply
+  lansync apply  [-f FILE] -network NAMES PROVIDER-FLAGS
+                                           change the named networks ("all" for every
+                                           declared network); report the rest as plan does
 
 Run "lansync COMMAND -h" for the flags of a command.
 `
@@ -85,8 +86,10 @@ type syncFlags struct {
 	providerName string
 	output       string
 	detailed     bool
+	networks     string
 
 	unifiURL        string
+	unifiLegacyURL  string
 	unifiSite       string
 	unifiKeyFile    string
 	unifiCA         string
@@ -106,8 +109,12 @@ func runSync(ctx context.Context, apply bool, args []string, stdout, stderr io.W
 	fs.StringVar(&f.providerName, "provider", "", `provider (required): "unifi"`)
 	fs.StringVar(&f.output, "o", "text", `output: "text" or "json" (one object per network)`)
 	fs.BoolVar(&f.detailed, "detailed-exitcode", false, "exit 2 when a network differs and was left as is")
+	if apply {
+		fs.StringVar(&f.networks, "network", "", `comma-separated names of the declared networks to change, or "all" (required)`)
+	}
 	fs.DurationVar(&f.timeout, "timeout", 2*time.Minute, "overall time limit")
 	fs.StringVar(&f.unifiURL, "unifi-url", "", "UniFi Integration API root, e.g. https://192.0.2.1/proxy/network/integration")
+	fs.StringVar(&f.unifiLegacyURL, "unifi-legacy-url", "", "root of the controller's own API, read to verify updates (default: -unifi-url without /integration)")
 	fs.StringVar(&f.unifiSite, "unifi-site", "default", "UniFi site: internal reference, name or ID")
 	fs.StringVar(&f.unifiKeyFile, "unifi-api-key-file", "", "file holding the UniFi API key (default: $LANSYNC_UNIFI_API_KEY)")
 	fs.StringVar(&f.unifiCA, "unifi-ca", "", "PEM file of the certificate(s) to trust for the controller (default: system roots)")
@@ -118,6 +125,18 @@ func runSync(ctx context.Context, apply bool, args []string, stdout, stderr io.W
 	if f.output != "text" && f.output != "json" {
 		fmt.Fprintf(stderr, "lansync: -o must be text or json\n")
 		return ExitError
+	}
+	var targets plan.Targets
+	if apply {
+		var err error
+		targets, err = parseTargets(f.networks)
+		if err != nil {
+			fmt.Fprintf(stderr, "lansync: %v\n", err)
+			if f.output == "json" {
+				writeFailure(stdout, f.providerName, err.Error())
+			}
+			return ExitError
+		}
 	}
 
 	c, err := spec.LoadFile(f.file)
@@ -141,7 +160,7 @@ func runSync(ctx context.Context, apply bool, args []string, stdout, stderr io.W
 	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
-	pl := plan.Make(ctx, c, p)
+	pl := plan.Make(ctx, c, p, targets)
 	if apply {
 		pl.Apply(ctx, p)
 	}
@@ -200,11 +219,31 @@ func newProvider(f syncFlags) (provider.Provider, error) {
 	client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 
 	return unifi.New(unifi.Config{
-		BaseURL: f.unifiURL,
-		Site:    f.unifiSite,
-		APIKey:  key,
-		Client:  client,
+		BaseURL:       f.unifiURL,
+		LegacyBaseURL: f.unifiLegacyURL,
+		Site:          f.unifiSite,
+		APIKey:        key,
+		Client:        client,
 	})
+}
+
+func parseTargets(s string) (plan.Targets, error) {
+	s = strings.TrimSpace(s)
+	switch s {
+	case "":
+		return plan.Targets{}, errors.New(`apply: -network is required: name the networks to change, or "all"`)
+	case "all":
+		return plan.Targets{All: true}, nil
+	}
+	var t plan.Targets
+	for _, n := range strings.Split(s, ",") {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			return plan.Targets{}, fmt.Errorf("apply: -network %q has an empty name", s)
+		}
+		t.Names = append(t.Names, n)
+	}
+	return t, nil
 }
 
 func printLoadError(w io.Writer, file string, err error) {
@@ -255,11 +294,7 @@ func writeText(w io.Writer, pl *plan.Plan, apply bool) {
 		if len(detail) == 0 {
 			detail = []string{""}
 		}
-		mode := string(n.Mode)
-		if !apply && n.Mode == lan.Apply {
-			mode += " (plan)"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", n.Network, n.Selector, mode, n.Status, detail[0])
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", n.Network, n.Selector, n.Mode, n.Status, detail[0])
 		for _, d := range detail[1:] {
 			fmt.Fprintf(tw, "\t\t\t\t%s\n", d)
 		}
