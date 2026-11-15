@@ -272,6 +272,14 @@ func writeJSON(w io.Writer, pl *plan.Plan) {
 	for _, n := range pl.Networks {
 		_ = enc.Encode(jsonLine{Provider: pl.Provider, NetworkResult: n})
 	}
+	for _, r := range pl.Reservations {
+		_ = enc.Encode(reservationLine{Provider: pl.Provider, ReservationResult: r})
+	}
+}
+
+type reservationLine struct {
+	Provider string `json:"provider"`
+	plan.ReservationResult
 }
 
 func writeText(w io.Writer, pl *plan.Plan, apply bool) {
@@ -298,6 +306,24 @@ func writeText(w io.Writer, pl *plan.Plan, apply bool) {
 		for _, d := range detail[1:] {
 			fmt.Fprintf(tw, "\t\t\t\t%s\n", d)
 		}
+	}
+	tw.Flush()
+
+	if len(pl.Reservations) == 0 {
+		return
+	}
+	fmt.Fprintln(w)
+	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "RESERVATION\tNETWORK\tIP\tMODE\tSTATUS\tDETAIL")
+	for _, r := range pl.Reservations {
+		var detail []string
+		for _, c := range r.Changes {
+			detail = append(detail, fmt.Sprintf("%s: %s -> %s", c.Field, c.From, c.To))
+		}
+		if r.Error != "" {
+			detail = append(detail, r.Error)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Reservation, r.Network, r.IP, r.Mode, r.Status, strings.Join(detail, "; "))
 	}
 	tw.Flush()
 }

@@ -121,6 +121,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		SelectorKeys: []string{"id", "name", "vlan"},
 		DHCPRanges:   1,
 		LeaseTime:    true,
+		Reservations: true,
 	}
 }
 

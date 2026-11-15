@@ -70,13 +70,29 @@ type NetworkResult struct {
 	update *provider.NetworkUpdate
 }
 
-// Plan is the result for every declared network.
+// ReservationResult is the plan, and after Apply the outcome, for one
+// declared reservation. It never carries the MAC or address of a device that
+// is not declared.
+type ReservationResult struct {
+	Reservation string   `json:"reservation"`
+	Network     string   `json:"network"`
+	IP          string   `json:"ip"`
+	Mode        Mode     `json:"mode"`
+	Status      Status   `json:"status"`
+	Changes     []Change `json:"changes,omitempty"`
+	Error       string   `json:"error,omitempty"`
+
+	update *provider.ReservationUpdate
+}
+
+// Plan is the result for every declared network and reservation.
 type Plan struct {
 	Provider string `json:"provider"`
 	// Errors are problems with the declaration as a whole, e.g. it needs a
 	// capability the provider does not have. When set, nothing is applied.
-	Errors   []string        `json:"errors,omitempty"`
-	Networks []NetworkResult `json:"networks"`
+	Errors       []string            `json:"errors,omitempty"`
+	Networks     []NetworkResult     `json:"networks"`
+	Reservations []ReservationResult `json:"reservations,omitempty"`
 }
 
 // Failed reports whether anything failed.
@@ -89,6 +105,11 @@ func (p *Plan) Failed() bool {
 			return true
 		}
 	}
+	for _, r := range p.Reservations {
+		if r.Status == Failed {
+			return true
+		}
+	}
 	return false
 }
 
@@ -96,6 +117,11 @@ func (p *Plan) Failed() bool {
 func (p *Plan) HasDrift() bool {
 	for _, n := range p.Networks {
 		if n.Status == Drift {
+			return true
+		}
+	}
+	for _, r := range p.Reservations {
+		if r.Status == Drift {
 			return true
 		}
 	}
@@ -133,7 +159,97 @@ func Make(ctx context.Context, c *lan.Config, p provider.Provider, targets Targe
 		}
 		pl.Networks = append(pl.Networks, r)
 	}
+
+	if len(c.Reservations) > 0 && caps.Reservations {
+		planReservations(ctx, c, p, pl, targets)
+	}
 	return pl
+}
+
+func planReservations(ctx context.Context, c *lan.Config, p provider.Provider, pl *Plan, targets Targets) {
+	rp, ok := p.(provider.ReservationProvider)
+	var state *provider.ReservationState
+	var err error
+	if !ok {
+		err = fmt.Errorf("%s says it manages reservations but does not implement them", p.Name())
+	} else {
+		state, err = rp.ObserveReservations(ctx)
+	}
+
+	declared := map[string]string{} // MAC -> declared name
+	for _, d := range c.Reservations {
+		declared[d.MAC.String()] = d.Name
+	}
+	networks := map[string]*NetworkResult{}
+	for i := range pl.Networks {
+		networks[pl.Networks[i].Network] = &pl.Networks[i]
+	}
+
+	for _, d := range c.Reservations {
+		r := ReservationResult{
+			Reservation: d.Name,
+			Network:     d.Network,
+			IP:          d.IP.String(),
+			Mode:        DryRun,
+		}
+		if targets.has(d.Network) {
+			r.Mode = Apply
+		}
+		n := networks[d.Network]
+		switch {
+		case err != nil:
+			r.Status, r.Error = Failed, fmt.Sprintf("observe reservations: %v", err)
+		case n == nil || n.Status == Failed:
+			r.Status, r.Error = Failed, "its network could not be checked"
+		default:
+			planReservation(d, n.ID, state, declared, &r)
+		}
+		pl.Reservations = append(pl.Reservations, r)
+	}
+}
+
+func planReservation(d lan.Reservation, networkID string, s *provider.ReservationState, declared map[string]string, r *ReservationResult) {
+	mac := d.MAC.String()
+	var current *provider.Reservation
+	for i, o := range s.Reservations {
+		if o.MAC.String() == mac {
+			current = &s.Reservations[i]
+			break
+		}
+	}
+	if current != nil && current.IP == d.IP {
+		r.Status = InSync
+		return
+	}
+
+	// The address must be free. Say who holds it only when that is
+	// declared too; an undeclared device stays anonymous.
+	holder := func(other string) string {
+		if name, ok := declared[other]; ok {
+			return "reservation " + name
+		}
+		return "a device that is not declared"
+	}
+	for _, o := range s.Reservations {
+		if o.IP == d.IP && o.MAC.String() != mac {
+			r.Status = Failed
+			r.Error = fmt.Sprintf("%s is already reserved for %s", d.IP, holder(o.MAC.String()))
+			return
+		}
+	}
+	if o, ok := s.InUse[d.IP]; ok && o.String() != mac {
+		r.Status = Failed
+		r.Error = fmt.Sprintf("%s is in use by %s; wait for its lease to end or move it first", d.IP, holder(o.String()))
+		return
+	}
+
+	from := "(none)"
+	if current != nil {
+		from = current.IP.String()
+	}
+	r.Changes = []Change{{Field: "ip", From: from, To: d.IP.String()}}
+	r.Status = Drift
+	r.update = &provider.ReservationUpdate{NetworkID: networkID, MAC: d.MAC, IP: d.IP, Name: d.Name}
 }
 
 func checkCapabilities(c *lan.Config, caps provider.Capabilities, name string) []error {
@@ -219,13 +335,43 @@ func planNetwork(ctx context.Context, n *lan.Network, p provider.Provider, r *Ne
 
 // Apply changes the targeted networks that drifted. It does nothing when the
 // plan has declaration-level errors.
+//
+// A network's reservations are applied before its DHCP pool, and the pool is
+// left alone if any of its reservations failed: shrinking a pool moves the
+// devices outside it, and their reservations are what keep them in place.
 func (pl *Plan) Apply(ctx context.Context, p provider.Provider) {
 	if len(pl.Errors) > 0 {
 		return
 	}
+	blocked := map[string]string{}
+	rp, _ := p.(provider.ReservationProvider)
+	for i := range pl.Reservations {
+		r := &pl.Reservations[i]
+		if r.Mode != Apply {
+			continue
+		}
+		if r.Status == Failed {
+			blocked[r.Network] = r.Reservation
+			continue
+		}
+		if r.Status != Drift || r.update == nil || rp == nil {
+			continue
+		}
+		if err := rp.SetReservation(ctx, *r.update); err != nil {
+			r.Status = Failed
+			r.Error = fmt.Sprintf("apply: %v", err)
+			blocked[r.Network] = r.Reservation
+			continue
+		}
+		r.Status = Applied
+	}
 	for i := range pl.Networks {
 		r := &pl.Networks[i]
 		if r.Status != Drift || r.Mode != Apply || r.update == nil {
+			continue
+		}
+		if name, ok := blocked[r.Network]; ok {
+			r.Error = fmt.Sprintf("not applied: reservation %s failed", name)
 			continue
 		}
 		if err := p.UpdateNetwork(ctx, *r.update); err != nil {
