@@ -147,19 +147,21 @@ Uses the official **Integration API** of UniFi Network 10.x.
 | `-unifi-tls-server-name` | Name to check the certificate against when the URL uses an IP. |
 
 `plan` needs read access. `apply` needs a key whose admin may change network
-settings; create a dedicated admin for it.
+settings; create a dedicated admin for it. UniFi has no read-only keys.
 
-**How an update is made safe.** The API replaces the whole network on update —
-a field left out is reset (a missing DHCP configuration means "no DHCP"). So
-lansync reads the network, changes only the DHCP pool and lease time, writes it
-back, reads it again, and fails loudly if anything else differs.
+**How an update is made.** Networks are found and read through the
+Integration API, but **not written through it**: its PUT replaces the whole
+network, and the network has settings that API does not show. On a UniFi
+Network 10.6 console a PUT that changed only the DHCP range also turned the
+network's mDNS flag off and dropped a dozen other fields.
 
-The Integration API does not show every setting of a network (mDNS, IGMP
-snooping, DHCP DNS options, …). So lansync also reads the network's full record
-from the controller's own API (`/api/s/{site}/rest/networkconf`, matched by
-`external_id`) before and after the update, and fails — naming each setting with
-its old and new value — if anything but the pool and lease time changed. That
-API is undocumented and only read.
+So lansync writes through the controller's own API (the one its web UI uses),
+sending only the fields it changes — `dhcpd_start`, `dhcpd_stop`,
+`dhcpd_leasetime` — to `/api/s/{site}/rest/networkconf/{_id}`, the record whose
+`external_id` is the Integration id. That API is undocumented, so every write is
+checked: the full record is read before and after, and the update fails, naming
+each setting with its old and new value, if anything else changed or the fields
+did not take the values sent. The Integration view must then show the same.
 
 It never turns a DHCP server on or off, and refuses networks that relay DHCP.
 

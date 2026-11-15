@@ -42,44 +42,44 @@ func TestCheckInvalid(t *testing.T) {
 // A controller with one network whose pool differs from the declaration.
 func controller(t *testing.T) *httptest.Server {
 	const site = "s1"
-	detail := map[string]any{
-		"id": "n2", "name": "F2", "management": "GATEWAY", "enabled": true, "vlanId": 2,
-		"ipv4Configuration": map[string]any{
-			"hostIpAddress": "192.0.2.1", "prefixLength": 24,
-			"dhcpConfiguration": map[string]any{
-				"mode":             "SERVER",
-				"ipAddressRange":   map[string]any{"start": "192.0.2.6", "stop": "192.0.2.254"},
-				"leaseTimeSeconds": 86400,
+	// One record, two views of it, as on a real console.
+	conf := map[string]any{"_id": "c2", "external_id": "n2", "name": "F2", "mdns_enabled": true,
+		"dhcpd_enabled": true, "dhcpd_start": "192.0.2.6", "dhcpd_stop": "192.0.2.254", "dhcpd_leasetime": 86400}
+	detail := func() map[string]any {
+		return map[string]any{
+			"id": "n2", "name": "F2", "management": "SWITCH", "enabled": true, "vlanId": 2,
+			"ipv4Configuration": map[string]any{
+				"hostIpAddress": "192.0.2.1", "prefixLength": 24,
+				"dhcpConfiguration": map[string]any{
+					"mode":             "SERVER",
+					"ipAddressRange":   map[string]any{"start": conf["dhcpd_start"], "stop": conf["dhcpd_stop"]},
+					"leaseTimeSeconds": conf["dhcpd_leasetime"],
+				},
 			},
-		},
+		}
 	}
-	conf := map[string]any{"external_id": "n2", "name": "F2", "mdns_enabled": true,
-		"dhcpd_start": "192.0.2.6", "dhcpd_stop": "192.0.2.254", "dhcpd_leasetime": 86400}
-	puts := 0
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/api/s/default/rest/networkconf":
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{conf}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{conf}})
+		case r.URL.Path == "/api/s/default/rest/networkconf/c2" && r.Method == http.MethodPut:
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for k, v := range body {
+				conf[k] = v
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{conf}})
 		case r.URL.Path == "/integration/v1/sites":
 			_ = json.NewEncoder(w).Encode(map[string]any{"offset": 0, "limit": 200, "count": 1, "totalCount": 1,
 				"data": []any{map[string]any{"id": site, "internalReference": "default", "name": "Default"}}})
 		case r.URL.Path == "/integration/v1/sites/"+site+"/networks":
 			_ = json.NewEncoder(w).Encode(map[string]any{"offset": 0, "limit": 200, "count": 1, "totalCount": 1,
-				"data": []any{map[string]any{"id": "n2", "name": "F2", "management": "GATEWAY", "vlanId": 2}}})
+				"data": []any{map[string]any{"id": "n2", "name": "F2", "management": "SWITCH", "vlanId": 2}}})
 		case r.URL.Path == "/integration/v1/sites/"+site+"/networks/n2" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(detail)
-		case r.URL.Path == "/integration/v1/sites/"+site+"/networks/n2" && r.Method == http.MethodPut:
-			puts++
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			body["id"] = "n2"
-			detail = body
-			dc := body["ipv4Configuration"].(map[string]any)["dhcpConfiguration"].(map[string]any)
-			rg := dc["ipAddressRange"].(map[string]any)
-			conf["dhcpd_start"], conf["dhcpd_stop"], conf["dhcpd_leasetime"] = rg["start"], rg["stop"], dc["leaseTimeSeconds"]
-			_ = json.NewEncoder(w).Encode(detail)
+			_ = json.NewEncoder(w).Encode(detail())
 		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))

@@ -3,7 +3,6 @@ package unifi_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -22,76 +21,71 @@ import (
 
 const siteID = "88f7af54-98f8-306a-a1c7-c9349722b1f6"
 
-// controller is a minimal Integration API: one site, networks kept as raw
-// JSON objects the way the controller returns them.
+// controller plays a UniFi console. It keeps one record per network, the way
+// the controller does, and serves two views of it: the full record of its own
+// API (rest/networkconf) and the Integration API's network.
 type controller struct {
-	t        *testing.T
-	mu       sync.Mutex
-	networks []map[string]any
-	puts     []map[string]any
-	// mutate, when set, changes the stored network after a PUT, to play a
-	// controller that does more than it was asked.
-	mutate func(map[string]any)
-	// mutateConf does the same to the full record, for settings the
-	// Integration API does not show.
-	mutateConf func(map[string]any)
-	// conf is the full record (rest/networkconf) per Integration id.
-	conf map[string]map[string]any
+	t  *testing.T
+	mu sync.Mutex
+	// records, each with "_id" and "external_id" (the Integration id).
+	records []map[string]any
+	puts    []map[string]any
+	// onPut, when set, changes a record after a PUT, to play a controller
+	// that does more than it was asked.
+	onPut func(map[string]any)
 }
 
-func network(id, name string, vlan int, host string, prefix int, dhcp map[string]any) map[string]any {
-	v4 := map[string]any{
-		"autoScaleEnabled": false,
-		"hostIpAddress":    host,
-		"prefixLength":     prefix,
-		"natOutboundIpAddressConfiguration": []any{
-			map[string]any{"type": "AUTO", "wanInterfaceId": "aaaaaaaa-0000-0000-0000-000000000001"},
-		},
-	}
-	if dhcp != nil {
-		v4["dhcpConfiguration"] = dhcp
-	}
+func record(n int, name string, vlan int, subnet string, dhcp bool) map[string]any {
 	return map[string]any{
-		"id":                    id,
-		"name":                  name,
-		"management":            "GATEWAY",
-		"enabled":               true,
-		"default":               false,
-		"vlanId":                vlan,
-		"metadata":              map[string]any{"origin": "USER_DEFINED"},
-		"isolationEnabled":      false,
-		"internetAccessEnabled": true,
-		"cellularBackupEnabled": true,
-		"zoneId":                "bbbbbbbb-0000-0000-0000-000000000001",
-		"ipv4Configuration":     v4,
-	}
-}
-
-func server() map[string]any {
-	return map[string]any{
-		"mode":                         "SERVER",
-		"ipAddressRange":               map[string]any{"start": "192.0.2.6", "stop": "192.0.2.254"},
-		"leaseTimeSeconds":             86400,
-		"pingConflictDetectionEnabled": true,
+		"_id":                strings.Repeat("0", 23) + strconv.Itoa(n),
+		"external_id":        "11111111-0000-0000-0000-00000000000" + strconv.Itoa(n),
+		"name":               name,
+		"vlan":               vlan,
+		"ip_subnet":          subnet,
+		"purpose":            "corporate",
+		"gateway_type":       "switch",
+		"mdns_enabled":       true,
+		"igmp_snooping":      false,
+		"upnp_lan_enabled":   false,
+		"dhcpd_dns_enabled":  false,
+		"dhcpd_enabled":      dhcp,
+		"dhcp_relay_enabled": false,
+		"dhcpd_start":        "192.0.2.6",
+		"dhcpd_stop":         "192.0.2.254",
+		"dhcpd_leasetime":    86400,
 	}
 }
 
 func newController(t *testing.T) *controller {
-	c := &controller{t: t, conf: map[string]map[string]any{}, networks: []map[string]any{
-		network("11111111-0000-0000-0000-000000000002", "F2", 2, "192.0.2.1", 24, server()),
-		network("11111111-0000-0000-0000-000000000003", "Relay", 3, "198.51.100.1", 24,
-			map[string]any{"mode": "RELAY", "dhcpServerIpAddresses": []any{"198.51.100.250"}}),
-		network("11111111-0000-0000-0000-000000000004", "NoDHCP", 4, "203.0.113.1", 24, nil),
+	relay := record(3, "Relay", 3, "198.51.100.1/24", false)
+	relay["dhcp_relay_enabled"] = true
+	return &controller{t: t, records: []map[string]any{
+		record(2, "F2", 2, "192.0.2.1/24", true),
+		relay,
+		record(4, "NoDHCP", 4, "203.0.113.1/24", false),
 	}}
-	for i, n := range c.networks {
-		id := n["id"].(string)
-		c.conf[id] = map[string]any{
-			"_id": fmt.Sprintf("%024d", i), "external_id": id, "name": n["name"], "vlan": n["vlanId"],
-			"mdns_enabled": true, "igmp_snooping": false, "dhcpd_dns_enabled": false,
-			"dhcpd_start": "192.0.2.6", "dhcpd_stop": "192.0.2.254", "dhcpd_leasetime": 86400,
+}
+
+// integration renders the Integration API's view of a record.
+func integration(r map[string]any) map[string]any {
+	host, bits, _ := strings.Cut(r["ip_subnet"].(string), "/")
+	prefix, _ := strconv.Atoi(bits)
+	v4 := map[string]any{"hostIpAddress": host, "prefixLength": prefix, "autoScaleEnabled": true}
+	switch {
+	case r["dhcp_relay_enabled"] == true:
+		v4["dhcpConfiguration"] = map[string]any{"mode": "RELAY", "dhcpServerIpAddresses": []any{"198.51.100.250"}}
+	case r["dhcpd_enabled"] == true:
+		v4["dhcpConfiguration"] = map[string]any{
+			"mode":             "SERVER",
+			"ipAddressRange":   map[string]any{"start": r["dhcpd_start"], "stop": r["dhcpd_stop"]},
+			"leaseTimeSeconds": r["dhcpd_leasetime"],
 		}
 	}
-	return c
+	return map[string]any{
+		"id": r["external_id"], "name": r["name"], "management": "SWITCH", "enabled": true,
+		"vlanId": r["vlan"], "default": false, "metadata": map[string]any{"origin": "USER_DEFINED"},
+		"ipv4Configuration": v4,
+	}
 }
 
 func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +95,6 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"statusCode":401}`, http.StatusUnauthorized)
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/proxy/network/integration")
 	write := func(v any) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(v)
@@ -116,80 +109,62 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		write(map[string]any{"offset": offset, "limit": limit, "count": end - offset, "totalCount": len(items), "data": items[offset:end]})
 	}
 
+	const integ = "/proxy/network/integration"
+	const own = "/proxy/network/api/s/default/rest/networkconf"
+	p := r.URL.Path
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/proxy/network/api/s/default/rest/networkconf":
-		var data []any
-		for _, n := range c.networks {
-			data = append(data, c.conf[n["id"].(string)])
+	case r.Method == http.MethodGet && p == own:
+		data := make([]any, len(c.records))
+		for i, rec := range c.records {
+			data[i] = rec
 		}
 		write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": data})
-	case r.Method == http.MethodGet && path == "/v1/sites":
+
+	case r.Method == http.MethodPut && strings.HasPrefix(p, own+"/"):
+		id := strings.TrimPrefix(p, own+"/")
+		for _, rec := range c.records {
+			if rec["_id"] != id {
+				continue
+			}
+			var body map[string]any
+			require.NoError(c.t, json.NewDecoder(r.Body).Decode(&body))
+			c.puts = append(c.puts, body)
+			for k, v := range body {
+				rec[k] = v
+			}
+			if c.onPut != nil {
+				c.onPut(rec)
+			}
+			write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{rec}})
+			return
+		}
+		write(map[string]any{"meta": map[string]any{"rc": "error", "msg": "api.err.IdInvalid"}, "data": []any{}})
+
+	case r.Method == http.MethodGet && p == integ+"/v1/sites":
 		paged([]any{
 			map[string]any{"id": "99999999-0000-0000-0000-000000000000", "internalReference": "other", "name": "Other"},
 			map[string]any{"id": siteID, "internalReference": "default", "name": "Default"},
 		})
-	case r.Method == http.MethodGet && path == "/v1/sites/"+siteID+"/networks":
-		var items []any
-		for _, n := range c.networks {
-			items = append(items, map[string]any{
-				"id": n["id"], "name": n["name"], "management": n["management"], "vlanId": n["vlanId"],
-				"enabled": n["enabled"], "default": n["default"], "metadata": n["metadata"],
-			})
+	case r.Method == http.MethodGet && p == integ+"/v1/sites/"+siteID+"/networks":
+		items := make([]any, len(c.records))
+		for i, rec := range c.records {
+			v := integration(rec)
+			items[i] = map[string]any{"id": v["id"], "name": v["name"], "management": v["management"], "vlanId": v["vlanId"]}
 		}
 		paged(items)
-	case strings.HasPrefix(path, "/v1/sites/"+siteID+"/networks/"):
-		id := strings.TrimPrefix(path, "/v1/sites/"+siteID+"/networks/")
-		i := c.find(id)
-		if i < 0 {
-			http.Error(w, `{"statusCode":404}`, http.StatusNotFound)
-			return
+	case r.Method == http.MethodGet && strings.HasPrefix(p, integ+"/v1/sites/"+siteID+"/networks/"):
+		id := strings.TrimPrefix(p, integ+"/v1/sites/"+siteID+"/networks/")
+		for _, rec := range c.records {
+			if rec["external_id"] == id {
+				write(integration(rec))
+				return
+			}
 		}
-		switch r.Method {
-		case http.MethodGet:
-			write(c.networks[i])
-		case http.MethodPut:
-			var body map[string]any
-			require.NoError(c.t, json.NewDecoder(r.Body).Decode(&body))
-			c.puts = append(c.puts, body)
-			stored := map[string]any{}
-			for k, v := range body {
-				stored[k] = v
-			}
-			for _, k := range []string{"id", "default", "metadata"} {
-				stored[k] = c.networks[i][k]
-			}
-			if c.mutate != nil {
-				c.mutate(stored)
-			}
-			c.networks[i] = stored
-			// The controller keeps one record; the Integration view and
-			// the full record are two views of it.
-			conf := c.conf[id]
-			if dc, ok := stored["ipv4Configuration"].(map[string]any)["dhcpConfiguration"].(map[string]any); ok {
-				if r, ok := dc["ipAddressRange"].(map[string]any); ok {
-					conf["dhcpd_start"], conf["dhcpd_stop"] = r["start"], r["stop"]
-				}
-				conf["dhcpd_leasetime"] = dc["leaseTimeSeconds"]
-			}
-			if c.mutateConf != nil {
-				c.mutateConf(conf)
-			}
-			write(stored)
-		default:
-			http.Error(w, "", http.StatusMethodNotAllowed)
-		}
+		http.Error(w, `{"statusCode":404}`, http.StatusNotFound)
 	default:
+		c.t.Errorf("unexpected %s %s", r.Method, p)
 		http.Error(w, `{"statusCode":404}`, http.StatusNotFound)
 	}
-}
-
-func (c *controller) find(id string) int {
-	for i, n := range c.networks {
-		if n["id"] == id {
-			return i
-		}
-	}
-	return -1
 }
 
 func setup(t *testing.T) (*controller, *unifi.Provider) {
@@ -209,6 +184,8 @@ func rng(a, b string) lan.Range {
 	return lan.Range{First: netip.MustParseAddr(a), Last: netip.MustParseAddr(b)}
 }
 
+const f2 = "11111111-0000-0000-0000-000000000002"
+
 func TestFindNetworks(t *testing.T) {
 	ctx := context.Background()
 	_, p := setup(t)
@@ -216,7 +193,7 @@ func TestFindNetworks(t *testing.T) {
 	ns, err := p.FindNetworks(ctx, map[string]string{"vlan": "2"})
 	require.NoError(t, err)
 	require.Equal(t, []provider.Network{{
-		ID:     "11111111-0000-0000-0000-000000000002",
+		ID:     f2,
 		Name:   "F2",
 		Subnet: netip.MustParsePrefix("192.0.2.0/24"),
 		DHCP:   &provider.DHCP{Ranges: lan.Ranges{rng("192.0.2.6", "192.0.2.254")}, LeaseTime: 24 * time.Hour},
@@ -240,86 +217,67 @@ func TestFindNetworks(t *testing.T) {
 	require.ErrorContains(t, err, `unsupported match key "colour"`)
 }
 
-func TestUpdateNetworkChangesOnlyDHCP(t *testing.T) {
+func TestUpdateNetworkSendsOnlyTheChangedFields(t *testing.T) {
 	ctx := context.Background()
 	c, p := setup(t)
-	before, _ := json.Marshal(c.networks[0])
 
 	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{
-		ID:         "11111111-0000-0000-0000-000000000002",
+		ID:         f2,
 		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
 		LeaseTime:  8 * time.Hour,
 	})
 	require.NoError(t, err)
-	require.Len(t, c.puts, 1)
-
-	put := c.puts[0]
-	for _, k := range []string{"id", "default", "metadata"} {
-		require.NotContains(t, put, k, "read-only field is not sent")
-	}
-
-	// Everything else is sent back unchanged.
-	var want map[string]any
-	require.NoError(t, json.Unmarshal(before, &want))
-	for _, k := range []string{"id", "default", "metadata"} {
-		delete(want, k)
-	}
-	dc := want["ipv4Configuration"].(map[string]any)["dhcpConfiguration"].(map[string]any)
-	dc["ipAddressRange"] = map[string]any{"start": "192.0.2.100", "stop": "192.0.2.199"}
-	dc["leaseTimeSeconds"] = float64(28800)
-	require.Equal(t, want, put)
+	require.Equal(t, []map[string]any{{
+		"dhcpd_start":     "192.0.2.100",
+		"dhcpd_stop":      "192.0.2.199",
+		"dhcpd_leasetime": float64(28800),
+	}}, c.puts)
 
 	ns, err := p.FindNetworks(ctx, map[string]string{"vlan": "2"})
 	require.NoError(t, err)
 	require.Equal(t, lan.Ranges{rng("192.0.2.100", "192.0.2.199")}, ns[0].DHCP.Ranges)
 	require.Equal(t, 8*time.Hour, ns[0].DHCP.LeaseTime)
+	require.Equal(t, true, c.records[0]["mdns_enabled"], "settings not sent are kept")
 }
 
 func TestUpdateNetworkLeaseOnly(t *testing.T) {
 	ctx := context.Background()
 	c, p := setup(t)
-	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: "11111111-0000-0000-0000-000000000002", LeaseTime: time.Hour})
-	require.NoError(t, err)
-	dc := c.puts[0]["ipv4Configuration"].(map[string]any)["dhcpConfiguration"].(map[string]any)
-	require.Equal(t, map[string]any{"start": "192.0.2.6", "stop": "192.0.2.254"}, dc["ipAddressRange"])
-	require.Equal(t, float64(3600), dc["leaseTimeSeconds"])
+	require.NoError(t, p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: f2, LeaseTime: time.Hour}))
+	require.Equal(t, []map[string]any{{"dhcpd_leasetime": float64(3600)}}, c.puts)
 }
 
 func TestUpdateNetworkDetectsSideEffects(t *testing.T) {
 	ctx := context.Background()
 	c, p := setup(t)
-	c.mutate = func(n map[string]any) { n["internetAccessEnabled"] = false }
-
-	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{
-		ID:         "11111111-0000-0000-0000-000000000002",
-		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
-	})
-	require.ErrorContains(t, err, "internetAccessEnabled")
-}
-
-func TestUpdateNetworkDetectsHiddenSideEffects(t *testing.T) {
-	ctx := context.Background()
-	c, p := setup(t)
-	c.mutateConf = func(n map[string]any) { n["mdns_enabled"] = false }
-
-	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{
-		ID:         "11111111-0000-0000-0000-000000000002",
-		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
-	})
+	// What the Integration API's PUT did on a real console.
+	c.onPut = func(r map[string]any) {
+		r["mdns_enabled"] = false
+		delete(r, "igmp_snooping")
+	}
+	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: f2, DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")}})
+	require.ErrorContains(t, err, "igmp_snooping: false -> (none)")
 	require.ErrorContains(t, err, "mdns_enabled: true -> false")
 }
 
-func TestUpdateNetworkChecksTheFullRecord(t *testing.T) {
+func TestUpdateNetworkChecksTheValues(t *testing.T) {
 	ctx := context.Background()
 	c, p := setup(t)
-	// The Integration view says the pool changed, the record does not.
-	c.mutateConf = func(n map[string]any) { n["dhcpd_stop"] = "192.0.2.254" }
-
-	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{
-		ID:         "11111111-0000-0000-0000-000000000002",
-		DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")},
-	})
+	c.onPut = func(r map[string]any) { r["dhcpd_stop"] = "192.0.2.254" }
+	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: f2, DHCPRanges: lan.Ranges{rng("192.0.2.100", "192.0.2.199")}})
 	require.ErrorContains(t, err, `dhcpd_stop is "192.0.2.254", want 192.0.2.199`)
+}
+
+func TestUpdateNetworkRefuses(t *testing.T) {
+	ctx := context.Background()
+	c, p := setup(t)
+	err := p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: "11111111-0000-0000-0000-000000000003", LeaseTime: time.Hour})
+	require.ErrorContains(t, err, "relays DHCP")
+	err = p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: "11111111-0000-0000-0000-000000000004", LeaseTime: time.Hour})
+	require.ErrorContains(t, err, "DHCP server is off")
+	err = p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: "nope", LeaseTime: time.Hour})
+	require.ErrorContains(t, err, "0 networkconf records")
+	require.Empty(t, c.puts)
 }
 
 func TestUpdateNetworkNeedsLegacyRoot(t *testing.T) {
@@ -328,18 +286,8 @@ func TestUpdateNetworkNeedsLegacyRoot(t *testing.T) {
 	defer srv.Close()
 	p, err := unifi.New(unifi.Config{BaseURL: srv.URL + "/somewhere", APIKey: "secret", Client: srv.Client()})
 	require.NoError(t, err)
-	err = p.UpdateNetwork(context.Background(), provider.NetworkUpdate{ID: "x", LeaseTime: time.Hour})
+	err = p.UpdateNetwork(context.Background(), provider.NetworkUpdate{ID: f2, LeaseTime: time.Hour})
 	require.ErrorContains(t, err, "legacy base URL")
-	require.Empty(t, c.puts)
-}
-
-func TestUpdateNetworkRefusesWithoutServer(t *testing.T) {
-	ctx := context.Background()
-	c, p := setup(t)
-	for _, id := range []string{"11111111-0000-0000-0000-000000000003", "11111111-0000-0000-0000-000000000004"} {
-		err := p.UpdateNetwork(ctx, provider.NetworkUpdate{ID: id, DHCPRanges: lan.Ranges{rng("198.51.100.100", "198.51.100.199")}})
-		require.Error(t, err)
-	}
 	require.Empty(t, c.puts)
 }
 
