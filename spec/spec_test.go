@@ -29,7 +29,6 @@ networks:
     subnet: 192.0.2.0/24
     layout: office
     dhcp: { block: dhcp, leaseTime: 8h }
-    mode: apply
   - name: wifi
     match: { name: "Office WiFi" }
     subnet: 198.51.100.0/23
@@ -57,7 +56,6 @@ func TestLoadExample(t *testing.T) {
 	f2 := c.Networks[0]
 	require.Equal(t, "floor-2", f2.Name)
 	require.Equal(t, map[string]string{"vlan": "2"}, f2.Selector)
-	require.Equal(t, lan.Apply, f2.Mode)
 	require.Len(t, f2.Blocks, 6)
 	require.Equal(t, "gateway", f2.Blocks[0].Name)
 	require.Equal(t, lan.Ranges{{First: addr("192.0.2.1"), Last: addr("192.0.2.1")}}, f2.Blocks[0].Ranges)
@@ -75,7 +73,6 @@ func TestLoadExample(t *testing.T) {
 	require.Equal(t, lan.Ranges{{First: addr("192.0.2.100"), Last: addr("192.0.2.199")}}, f2.DHCP.Ranges)
 
 	wifi := c.Networks[1]
-	require.Equal(t, lan.DryRun, wifi.Mode, "mode defaults to dry-run")
 	require.Equal(t, time.Duration(0), wifi.DHCP.LeaseTime, "lease time is unmanaged when omitted")
 	// Offsets count from the network address, so they work past /24.
 	require.Equal(t, lan.Ranges{{First: addr("198.51.100.10"), Last: addr("198.51.101.144")}}, wifi.DHCP.Ranges)
@@ -110,9 +107,9 @@ func TestLoadRejects(t *testing.T) {
 			want: "match is required",
 		},
 		{
-			name: "bad mode",
-			src:  base("  - { name: a, match: { vlan: 1 }, subnet: 192.0.2.0/24, mode: yes-please }\n"),
-			want: "mode:",
+			name: "mode is not part of the declaration",
+			src:  base("  - { name: a, match: { vlan: 1 }, subnet: 192.0.2.0/24, mode: apply }\n"),
+			want: `unknown field "mode"`,
 		},
 		{
 			name: "offset outside",

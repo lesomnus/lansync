@@ -42,37 +42,44 @@ func TestCheckInvalid(t *testing.T) {
 // A controller with one network whose pool differs from the declaration.
 func controller(t *testing.T) *httptest.Server {
 	const site = "s1"
-	detail := map[string]any{
-		"id": "n2", "name": "F2", "management": "GATEWAY", "enabled": true, "vlanId": 2,
-		"ipv4Configuration": map[string]any{
-			"hostIpAddress": "192.0.2.1", "prefixLength": 24,
-			"dhcpConfiguration": map[string]any{
-				"mode":             "SERVER",
-				"ipAddressRange":   map[string]any{"start": "192.0.2.6", "stop": "192.0.2.254"},
-				"leaseTimeSeconds": 86400,
+	// One record, two views of it, as on a real console.
+	conf := map[string]any{"_id": "c2", "external_id": "n2", "name": "F2", "mdns_enabled": true,
+		"dhcpd_enabled": true, "dhcpd_start": "192.0.2.6", "dhcpd_stop": "192.0.2.254", "dhcpd_leasetime": 86400}
+	detail := func() map[string]any {
+		return map[string]any{
+			"id": "n2", "name": "F2", "management": "SWITCH", "enabled": true, "vlanId": 2,
+			"ipv4Configuration": map[string]any{
+				"hostIpAddress": "192.0.2.1", "prefixLength": 24,
+				"dhcpConfiguration": map[string]any{
+					"mode":             "SERVER",
+					"ipAddressRange":   map[string]any{"start": conf["dhcpd_start"], "stop": conf["dhcpd_stop"]},
+					"leaseTimeSeconds": conf["dhcpd_leasetime"],
+				},
 			},
-		},
+		}
 	}
-	puts := 0
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/api/s/default/rest/networkconf":
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{conf}})
+		case r.URL.Path == "/api/s/default/rest/networkconf/c2" && r.Method == http.MethodPut:
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for k, v := range body {
+				conf[k] = v
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{conf}})
 		case r.URL.Path == "/integration/v1/sites":
 			_ = json.NewEncoder(w).Encode(map[string]any{"offset": 0, "limit": 200, "count": 1, "totalCount": 1,
 				"data": []any{map[string]any{"id": site, "internalReference": "default", "name": "Default"}}})
 		case r.URL.Path == "/integration/v1/sites/"+site+"/networks":
 			_ = json.NewEncoder(w).Encode(map[string]any{"offset": 0, "limit": 200, "count": 1, "totalCount": 1,
-				"data": []any{map[string]any{"id": "n2", "name": "F2", "management": "GATEWAY", "vlanId": 2}}})
+				"data": []any{map[string]any{"id": "n2", "name": "F2", "management": "SWITCH", "vlanId": 2}}})
 		case r.URL.Path == "/integration/v1/sites/"+site+"/networks/n2" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(detail)
-		case r.URL.Path == "/integration/v1/sites/"+site+"/networks/n2" && r.Method == http.MethodPut:
-			puts++
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			body["id"] = "n2"
-			detail = body
-			_ = json.NewEncoder(w).Encode(detail)
+			_ = json.NewEncoder(w).Encode(detail())
 		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
@@ -80,7 +87,7 @@ func controller(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func writeFiles(t *testing.T, srv *httptest.Server, mode string) (decl, ca string) {
+func writeFiles(t *testing.T, srv *httptest.Server) (decl, ca string) {
 	dir := t.TempDir()
 	decl = filepath.Join(dir, "lansync.yaml")
 	require.NoError(t, os.WriteFile(decl, []byte(`
@@ -90,7 +97,6 @@ networks:
     subnet: 192.0.2.0/24
     blocks: [{ name: dhcp, ranges: [.100-.199] }]
     dhcp: { block: dhcp, leaseTime: 8h }
-    mode: `+mode+`
 `), 0o600))
 	ca = filepath.Join(dir, "ca.pem")
 	cert := srv.Certificate()
@@ -102,15 +108,15 @@ func TestPlanAndApply(t *testing.T) {
 	srv := controller(t)
 	t.Setenv("LANSYNC_UNIFI_API_KEY", "k")
 
-	decl, ca := writeFiles(t, srv, "apply")
+	decl, ca := writeFiles(t, srv)
 	args := []string{"-f", decl, "-provider", "unifi", "-unifi-url", srv.URL + "/integration", "-unifi-ca", ca}
 
 	code, out, errOut := run(t, append([]string{"plan", "-detailed-exitcode"}, args...)...)
 	require.Equal(t, cli.ExitDrift, code, errOut)
-	require.Contains(t, out, "apply (plan)")
+	require.Contains(t, out, "dry-run")
 	require.Contains(t, out, "dhcp.ranges: 192.0.2.6-192.0.2.254 -> 192.0.2.100-192.0.2.199")
 
-	code, out, errOut = run(t, append([]string{"apply", "-o", "json"}, args...)...)
+	code, out, errOut = run(t, append([]string{"apply", "-network", "F2", "-o", "json"}, args...)...)
 	require.Equal(t, cli.ExitOK, code, errOut)
 	var line map[string]any
 	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(out)), &line))
@@ -121,19 +127,25 @@ func TestPlanAndApply(t *testing.T) {
 	require.Contains(t, out, "in-sync")
 }
 
-func TestApplyLeavesDryRun(t *testing.T) {
+func TestApplyNeedsTargets(t *testing.T) {
 	srv := controller(t)
 	t.Setenv("LANSYNC_UNIFI_API_KEY", "k")
-	decl, ca := writeFiles(t, srv, "dry-run")
-	code, out, errOut := run(t, "apply", "-detailed-exitcode", "-f", decl, "-provider", "unifi", "-unifi-url", srv.URL+"/integration", "-unifi-ca", ca)
-	require.Equal(t, cli.ExitDrift, code, errOut)
-	require.Contains(t, out, "drift")
+	decl, ca := writeFiles(t, srv)
+	args := []string{"-f", decl, "-provider", "unifi", "-unifi-url", srv.URL + "/integration", "-unifi-ca", ca}
+
+	code, _, errOut := run(t, append([]string{"apply"}, args...)...)
+	require.Equal(t, cli.ExitError, code)
+	require.Contains(t, errOut, "-network is required")
+
+	code, out, _ := run(t, append([]string{"apply", "-network", "nope"}, args...)...)
+	require.Equal(t, cli.ExitError, code)
+	require.Contains(t, out, `network "nope" is not declared`)
 }
 
 func TestUntrustedCertificate(t *testing.T) {
 	srv := controller(t)
 	t.Setenv("LANSYNC_UNIFI_API_KEY", "k")
-	decl, _ := writeFiles(t, srv, "apply")
+	decl, _ := writeFiles(t, srv)
 	code, out, _ := run(t, "plan", "-f", decl, "-provider", "unifi", "-unifi-url", srv.URL+"/integration")
 	require.Equal(t, cli.ExitError, code)
 	require.Contains(t, out, "certificate")

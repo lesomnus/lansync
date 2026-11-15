@@ -50,7 +50,6 @@ type Network struct {
 	// Blocks are added to the layout's blocks.
 	Blocks []Block `yaml:"blocks"`
 	DHCP   *DHCP   `yaml:"dhcp"`
-	Mode   string  `yaml:"mode"`
 }
 
 type DHCP struct {
@@ -208,15 +207,6 @@ func (f *File) resolveNetwork(n Network) (*lan.Network, []error) {
 		sel[k] = string(v)
 	}
 
-	mode := lan.DryRun
-	switch n.Mode {
-	case "", string(lan.DryRun):
-	case string(lan.Apply):
-		mode = lan.Apply
-	default:
-		fail("mode: %q is not one of %q, %q", n.Mode, lan.DryRun, lan.Apply)
-	}
-
 	subnet, err := netip.ParsePrefix(n.Subnet)
 	switch {
 	case n.Subnet == "":
@@ -306,7 +296,6 @@ func (f *File) resolveNetwork(n Network) (*lan.Network, []error) {
 		Selector: sel,
 		Subnet:   subnet,
 		Blocks:   blocks,
-		Mode:     mode,
 	}
 
 	if n.DHCP != nil {

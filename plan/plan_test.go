@@ -79,15 +79,15 @@ layouts:
     blocks:
       - { name: dhcp, ranges: [.100-.199] }
 networks:
-  - { name: F2, match: { vlan: 2 }, subnet: 192.0.2.0/24, layout: office, dhcp: { block: dhcp, leaseTime: 8h }, mode: apply }
-  - { name: F3, match: { vlan: 3 }, subnet: 198.51.100.0/24, layout: office, dhcp: { block: dhcp, leaseTime: 8h }, mode: apply }
+  - { name: F2, match: { vlan: 2 }, subnet: 192.0.2.0/24, layout: office, dhcp: { block: dhcp, leaseTime: 8h } }
+  - { name: F3, match: { vlan: 3 }, subnet: 198.51.100.0/24, layout: office, dhcp: { block: dhcp, leaseTime: 8h } }
   - { name: F4, match: { vlan: 4 }, subnet: 203.0.113.0/24, layout: office, dhcp: { block: dhcp, leaseTime: 8h } }
 `
 
 func TestPlanAndApply(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
-	pl := plan.Make(ctx, cfg(t, twoNetworks), f)
+	pl := plan.Make(ctx, cfg(t, twoNetworks), f, plan.Targets{Names: []string{"F2", "F3"}})
 	require.Empty(t, pl.Errors)
 	require.Len(t, pl.Networks, 3)
 
@@ -118,7 +118,7 @@ func TestApplyFailure(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
 	f.failOn = "n2"
-	pl := plan.Make(ctx, cfg(t, twoNetworks), f)
+	pl := plan.Make(ctx, cfg(t, twoNetworks), f, plan.Targets{All: true})
 	pl.Apply(ctx, f)
 	require.Equal(t, plan.Failed, pl.Networks[0].Status)
 	require.Contains(t, pl.Networks[0].Error, "boom")
@@ -139,7 +139,7 @@ func TestPlanNetworkProblems(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pl := plan.Make(ctx, cfg(t, "networks:\n  - "+tt.net+"\n"), newFake())
+			pl := plan.Make(ctx, cfg(t, "networks:\n  - "+tt.net+"\n"), newFake(), plan.Targets{})
 			require.Equal(t, plan.Failed, pl.Networks[0].Status)
 			require.Contains(t, pl.Networks[0].Error, tt.want)
 		})
@@ -155,12 +155,11 @@ networks:
     subnet: 192.0.2.0/24
     blocks: [{ name: p, ranges: [.10-.20, .30-.40] }]
     dhcp: { block: p }
-    mode: apply
 reservations:
   - { name: r, mac: '00:00:5e:00:53:01', network: x, ip: .50 }
 `)
 	f := newFake()
-	pl := plan.Make(ctx, c, f)
+	pl := plan.Make(ctx, c, f, plan.Targets{All: true})
 	all := strings.Join(pl.Errors, "\n")
 	require.Contains(t, all, `cannot match by "colour"`)
 	require.Contains(t, all, "has 2 ranges but fake supports 1")
@@ -168,4 +167,26 @@ reservations:
 
 	pl.Apply(ctx, f)
 	require.Empty(t, f.updates, "nothing is applied when the declaration needs more than the provider has")
+}
+
+func TestTargets(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+
+	pl := plan.Make(ctx, cfg(t, twoNetworks), f, plan.Targets{})
+	require.Equal(t, plan.DryRun, pl.Networks[0].Mode)
+	pl.Apply(ctx, f)
+	require.Empty(t, f.updates, "no targets, no changes")
+
+	pl = plan.Make(ctx, cfg(t, twoNetworks), f, plan.Targets{Names: []string{"F4"}})
+	require.Equal(t, plan.DryRun, pl.Networks[0].Mode)
+	require.Equal(t, plan.Apply, pl.Networks[2].Mode)
+	pl.Apply(ctx, f)
+	require.Len(t, f.updates, 1)
+	require.Equal(t, "n4", f.updates[0].ID)
+
+	pl = plan.Make(ctx, cfg(t, twoNetworks), f, plan.Targets{Names: []string{"F9"}})
+	require.Contains(t, strings.Join(pl.Errors, "\n"), `network "F9" is not declared`)
+	pl.Apply(ctx, f)
+	require.Len(t, f.updates, 1, "a typo in the targets applies nothing")
 }
