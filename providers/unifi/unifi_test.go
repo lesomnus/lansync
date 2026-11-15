@@ -3,6 +3,7 @@ package unifi_test
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -33,6 +34,13 @@ type controller struct {
 	// onPut, when set, changes a record after a PUT, to play a controller
 	// that does more than it was asked.
 	onPut func(map[string]any)
+
+	// users are client records (rest/user); sta the connected clients.
+	users     []map[string]any
+	sta       []map[string]any
+	userPuts  []map[string]any
+	userPosts []map[string]any
+	onUserPut func(map[string]any)
 }
 
 func record(n int, name string, vlan int, subnet string, dhcp bool) map[string]any {
@@ -111,8 +119,53 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	const integ = "/proxy/network/integration"
 	const own = "/proxy/network/api/s/default/rest/networkconf"
+	const users = "/proxy/network/api/s/default/rest/user"
 	p := r.URL.Path
 	switch {
+	case r.Method == http.MethodGet && p == users:
+		data := make([]any, len(c.users))
+		for i, u := range c.users {
+			data[i] = u
+		}
+		write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": data})
+	case r.Method == http.MethodGet && p == "/proxy/network/api/s/default/stat/sta":
+		data := make([]any, len(c.sta))
+		for i, u := range c.sta {
+			data[i] = u
+		}
+		write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": data})
+	case r.Method == http.MethodPut && strings.HasPrefix(p, users+"/"):
+		id := strings.TrimPrefix(p, users+"/")
+		var body map[string]any
+		require.NoError(c.t, json.NewDecoder(r.Body).Decode(&body))
+		c.userPuts = append(c.userPuts, body)
+		for _, u := range c.users {
+			if u["_id"] == id {
+				for k, v := range body {
+					u[k] = v
+				}
+				u["last_seen"] = 2000 // volatile; must not count as a change
+				if _, ok := body["name"]; ok {
+					u["noted"] = true // what a real console does when a client is named
+				}
+				if c.onUserPut != nil {
+					c.onUserPut(u)
+				}
+				write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{u}})
+				return
+			}
+		}
+		write(map[string]any{"meta": map[string]any{"rc": "error", "msg": "api.err.IdInvalid"}})
+	case r.Method == http.MethodPost && p == users:
+		var body map[string]any
+		require.NoError(c.t, json.NewDecoder(r.Body).Decode(&body))
+		c.userPosts = append(c.userPosts, body)
+		u := map[string]any{"_id": "u-new"}
+		for k, v := range body {
+			u[k] = v
+		}
+		c.users = append(c.users, u)
+		write(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{u}})
 	case r.Method == http.MethodGet && p == own:
 		data := make([]any, len(c.records))
 		for i, rec := range c.records {
@@ -299,4 +352,87 @@ func TestWrongKey(t *testing.T) {
 	require.NoError(t, err)
 	_, err = p.FindNetworks(context.Background(), map[string]string{"vlan": "2"})
 	require.ErrorContains(t, err, "401")
+}
+
+func withClients(c *controller) {
+	c.users = []map[string]any{
+		{"_id": "u1", "mac": "00:00:5e:00:53:01", "name": "", "use_fixedip": true, "fixed_ip": "192.0.2.36",
+			"noted": false, "usergroup_id": "g", "last_seen": 1000, "hostname": "ap"},
+		{"_id": "u2", "mac": "00:00:5e:00:53:02", "name": "Front desk", "use_fixedip": false,
+			"noted": true, "usergroup_id": "g", "last_seen": 1000},
+		{"_id": "u9", "mac": "00:00:5e:00:53:99", "name": "someone", "use_fixedip": true, "fixed_ip": "192.0.2.14"},
+	}
+	c.sta = []map[string]any{
+		{"mac": "00:00:5e:00:53:01", "ip": "192.0.2.36"},
+		{"mac": "00:00:5e:00:53:98", "ip": "192.0.2.15"},
+		{"mac": "00:00:5e:00:53:97"}, // no address yet
+	}
+}
+
+func hw(s string) net.HardwareAddr {
+	m, err := net.ParseMAC(s)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+func TestObserveReservations(t *testing.T) {
+	c, p := setup(t)
+	withClients(c)
+	s, err := p.ObserveReservations(context.Background())
+	require.NoError(t, err)
+	require.ElementsMatch(t, []provider.Reservation{
+		{MAC: hw("00:00:5e:00:53:01"), IP: netip.MustParseAddr("192.0.2.36")},
+		{MAC: hw("00:00:5e:00:53:99"), IP: netip.MustParseAddr("192.0.2.14")},
+	}, s.Reservations)
+	require.Equal(t, hw("00:00:5e:00:53:98"), s.InUse[netip.MustParseAddr("192.0.2.15")])
+	require.Len(t, s.InUse, 2)
+}
+
+func TestSetReservationMovesAnExistingOne(t *testing.T) {
+	c, p := setup(t)
+	withClients(c)
+	err := p.SetReservation(context.Background(), provider.ReservationUpdate{
+		NetworkID: f2, MAC: hw("00:00:5e:00:53:01"), IP: netip.MustParseAddr("192.0.2.11"), Name: "ap-01",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []map[string]any{{
+		"use_fixedip": true, "fixed_ip": "192.0.2.11", "network_id": strings.Repeat("0", 23) + "2", "name": "ap-01",
+	}}, c.userPuts, "an unnamed client gets the declared name")
+}
+
+func TestSetReservationKeepsAName(t *testing.T) {
+	c, p := setup(t)
+	withClients(c)
+	err := p.SetReservation(context.Background(), provider.ReservationUpdate{
+		NetworkID: f2, MAC: hw("00:00:5e:00:53:02"), IP: netip.MustParseAddr("192.0.2.12"), Name: "ap-02",
+	})
+	require.NoError(t, err)
+	require.NotContains(t, c.userPuts[0], "name")
+	require.Equal(t, "Front desk", c.users[1]["name"])
+}
+
+func TestSetReservationCreatesAClient(t *testing.T) {
+	c, p := setup(t)
+	withClients(c)
+	err := p.SetReservation(context.Background(), provider.ReservationUpdate{
+		NetworkID: f2, MAC: hw("00:00:5e:00:53:03"), IP: netip.MustParseAddr("192.0.2.13"), Name: "ap-03",
+	})
+	require.NoError(t, err)
+	require.Empty(t, c.userPuts)
+	require.Equal(t, []map[string]any{{
+		"mac": "00:00:5e:00:53:03", "use_fixedip": true, "fixed_ip": "192.0.2.13",
+		"network_id": strings.Repeat("0", 23) + "2", "name": "ap-03",
+	}}, c.userPosts)
+}
+
+func TestSetReservationDetectsSideEffects(t *testing.T) {
+	c, p := setup(t)
+	withClients(c)
+	c.onUserPut = func(u map[string]any) { u["usergroup_id"] = "other" }
+	err := p.SetReservation(context.Background(), provider.ReservationUpdate{
+		NetworkID: f2, MAC: hw("00:00:5e:00:53:02"), IP: netip.MustParseAddr("192.0.2.12"),
+	})
+	require.ErrorContains(t, err, `usergroup_id: "g" -> "other"`)
 }

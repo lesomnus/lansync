@@ -21,10 +21,10 @@ reads and writes one kind of controller. This repository has a provider for
 |---|---|
 | DHCP pool (start–stop) | ✅ |
 | DHCP lease time | ✅ |
-| Reservations (MAC → IP) | declared and validated; not applied yet |
+| Reservations (MAC → IP) | ✅ create and move; never deleted |
 
 lansync only touches what you declare. Networks, fields and reservations that are
-not in the file are read at most, never changed.
+not in the file are read at most, never changed — and never printed.
 
 ## The declaration
 
@@ -104,6 +104,20 @@ because it names it. Use YAML comments for notes.
 | `block` | Optional. When set, `ip` must be in that block. |
 | `ip` | Address as above. Must be outside the DHCP pool. |
 
+A reservation is applied when its network is named in `apply -network`. Before
+changing anything lansync checks that the address is free: not reserved for
+another device, and not in use by another connected client. If it is taken, the
+reservation fails and names the holder only if the holder is declared too —
+devices that are not in the file are never named, and their MAC addresses and
+addresses never appear in the output.
+
+A network's reservations are applied before its DHCP pool, and the pool is left
+alone if any of them failed: shrinking a pool moves the devices outside it, and
+their reservations are what keep them in place.
+
+Removing a reservation from the file leaves it on the controller; lansync does
+not delete reservations.
+
 ## Commands
 
 ```sh
@@ -164,6 +178,12 @@ each setting with its old and new value, if anything else changed or the fields
 did not take the values sent. The Integration view must then show the same.
 
 It never turns a DHCP server on or off, and refuses networks that relay DHCP.
+
+Reservations are the controller's client records (`/api/s/{site}/rest/user`).
+Setting one sends only `use_fixedip`, `fixed_ip` and `network_id` (and `name`,
+the declared name, when the client has none — an existing name is kept), and
+compares the client record before and after the same way. A device the
+controller has never seen is created with `POST`.
 
 UniFi has one range per DHCP pool, so a `dhcp.block` with several ranges is
 refused for UniFi.
